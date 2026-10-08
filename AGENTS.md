@@ -85,7 +85,7 @@ Windows 11 用のアニメーション GIF ビューワです。依頼者の要�
 - `publish/` はビルドで作られるものなので、git の管理から外した
 - MIT ライセンスを付け、README を英語（`README.md`）と日本語（`README.ja.md`）に分けた
 - スクリーンショットに第三者の GIF を使わないよう、サンプル GIF を自作した（`docs/sample.gif`）
-- GitHub に Public リポジトリ `fast_gifanim` として公開した（gh が入っていないため、空のリポジトリは利用者が作成し、push はエージェントが行った）
+- GitHub に Public リポジトリ `fast_gifanim`（https://github.com/terakenxx/fast_gifanim）として公開した（gh が入っていないため、空のリポジトリは利用者が作成し、push はエージェントが行った）
 
 ## ビルドとテストの手順
 
