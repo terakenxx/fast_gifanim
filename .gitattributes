@@ -1,0 +1,6 @@
+# cmd / rc は CRLF でないと誤動作するため固定
+*.bat eol=crlf
+*.rc  eol=crlf
+
+*.exe binary
+*.ico binary
