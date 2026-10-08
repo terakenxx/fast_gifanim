@@ -1,67 +1,90 @@
 # FastGif
 
-Windows 11 用の軽量アニメーション GIF ビューワ。1 枚目をできるだけ早く表示することを重視しています。
+**English** | [日本語](README.ja.md)
 
-- C++ / Win32 API のみ、CRT 非依存 → **単体 exe（約 37KB、うちアイコン約 16KB）、追加 DLL なし**
-- 配布用の exe は `publish\fastgif.exe`
-- 依存はすべて Windows 標準の DLL（kernel32 / user32 / gdi32 / dwmapi）
+A tiny, fast animated GIF viewer for Windows 11. Its main goal is to put the **first frame on screen as quickly as possible** and then play the animation.
 
-## 使い方
+![FastGif screenshot](docs/screenshot.png)
+
+- Written in C++ with the Win32 API only, without the C runtime (CRT)
+- **Single self-contained exe (about 37 KB, of which about 16 KB is the icon). No extra DLLs.**
+- Uses only DLLs that ship with Windows (kernel32 / user32 / gdi32 / dwmapi)
+- Includes its own GIF decoder; it does not use WIC
+
+## Features
+
+- Fast startup. The first frame is decoded in about 0.2–1.9 ms on our test files, compared with 0.45–9.1 ms for WIC.
+- Smooth, accurate playback with a high-resolution timer
+- Large images are scaled down to fit the window, keeping the aspect ratio. Smaller images are shown at 100% in the center.
+- The mouse wheel goes to the previous or next GIF in the same folder. Files are sorted by name, numbers are compared numerically, and the list wraps around.
+- Remembers the window position, size and maximized state
+- Supports drag & drop, the Open dialog, and command-line arguments, so file association works too
+- Fullscreen mode, frame stepping, and a choice of backgrounds for transparent areas
+
+## Usage
 
 ```
-fastgif.exe <ファイル.gif>
+fastgif.exe <file.gif>
 ```
 
-exe に GIF をドラッグ&ドロップしても開けます。起動後のウィンドウへのドロップや Ctrl+O でも開けます。
+You can also drop a GIF onto the exe or onto the window, or press Ctrl+O.
 
-コマンドライン引数の 1 つ目をファイルとして開くので、エクスプローラーの関連付け（GIF を右クリック →「プログラムから開く」→「別のプログラムを選択」→ fastgif.exe を選び「常に使う」）でも開けます。
+To open GIFs with FastGif from Explorer, right-click a GIF, choose "Open with", then "Choose another app", select `fastgif.exe`, and pick "Always".
 
-## 表示とウィンドウ
+### Controls
 
-- ウィンドウより大きい画像は、縦横比を保ったまま縮小して収めます。ウィンドウより小さい画像は等倍のまま中央に表示し、周りは余白になります
-- 終了時のウィンドウ位置・サイズ・最大化状態を `fastgif.ini` に保存し、次回は同じ位置・サイズで起動します
-  - 保存先は exe と同じフォルダです。そこに書き込めない場合（Program Files など）に限り、`%APPDATA%\FastGif\fastgif.ini` に保存します
-  - 読み込みも同じ順です。exe フォルダの ini が書き込み可能ならそれを使い、そうでないときだけ `%APPDATA%` 側を読みます
-  - 保存した位置のモニタが外れている場合は、サイズだけ引き継いでマウスのあるモニタの中央に開きます
-
-| 操作 | 機能 |
+| Key / mouse | Action |
 |---|---|
-| Space | 再生 / 一時停止 |
-| ← / → | コマ送り（一時停止します） |
-| Home | 最初のフレームへ |
-| PageUp / PageDown, ↑ / ↓ | 前 / 次の GIF |
-| マウスホイール | 上: 前の GIF / 下: 次の GIF（同じフォルダ、名前順・数字は数値順、端で一周） |
-| F / F11 / Enter / ダブルクリック | フルスクリーン |
-| B | 透過部分の背景切替（市松 / 暗灰 / 白 / 黒） |
-| Ctrl+O | ファイルを開く |
-| F1 / 右クリック | 操作説明 |
-| Esc | フルスクリーン解除 / 終了 |
+| Space | Play / pause |
+| ← / → | Previous / next frame (pauses playback) |
+| Home | Go to the first frame |
+| Mouse wheel | Up: previous GIF / down: next GIF in the same folder |
+| PageUp / PageDown, ↑ / ↓ | Previous / next GIF |
+| F / F11 / Enter / double-click | Toggle fullscreen |
+| B | Change the background behind transparent areas (checkerboard / dark gray / white / black) |
+| Ctrl+O | Open a file |
+| F1 / right-click | Show help |
+| Esc | Leave fullscreen, or quit |
 
-## 高速化の工夫
+### Window settings (fastgif.ini)
 
-- ファイルはメモリマップで開き、ヘッダと 1 枚目の位置だけを解析。残りのフレームは再生に合わせて逐次解析
-- フォルダ内のファイル一覧は起動時には作らず、最初にホイール（または PageUp/PageDown）で移動したときに 1 回だけ走査してキャッシュ
-- 1 枚目のデコードを別スレッドで行い、ウィンドウ生成と並行させる
-- ウィンドウ表示アニメーション（DWM トランジション）を無効化して即座に表示
-- shell32 / comdlg32 は D&D・ファイルダイアログを使うときだけ動的ロード
-- 独自 LZW デコーダ：辞書を「出力済みバッファ上の位置＋長さ」で持ち、文字列を直接コピー
-- 次フレームは表示直後に先読みデコードし、高精度 Waitable Timer で絶対時刻ベースにタイミングを合わせる（ズレが蓄積しない）
+- When you close the window, its position, size and maximized state are saved to `fastgif.ini`. The next launch opens with the same position and size.
+- The file is saved next to the exe. **Only if that folder is not writable** (for example `Program Files`), it is saved to `%APPDATA%\FastGif\fastgif.ini` instead. Loading follows the same order.
+- If the saved position is on a monitor that is no longer connected, the saved size is kept and the window is centered on the monitor under the mouse cursor.
 
-## ビルド
+## How it gets the first frame up fast
 
-Visual Studio 2022（C++ デスクトップ開発）が必要です。
+- The file is memory-mapped. At startup only the header and the location of the first frame are parsed. Later frames are parsed as playback reaches them.
+- The first frame is decoded on a worker thread while the main thread creates the window.
+- The DWM window-open animation is turned off, so the window appears immediately.
+- The folder is not scanned at startup. It is scanned once, the first time you move to another file with the wheel or PageUp/PageDown.
+- shell32 (drag & drop) and comdlg32 (Open dialog) are loaded only when they are first used.
+- The LZW decoder stores dictionary entries as an offset and length into the output already written, and copies strings directly from there.
+- After each frame is shown, the next frame is decoded ahead of time. Frames switch on a high-resolution waitable timer at absolute deadlines, so timing errors do not add up.
+
+## Building
+
+You need Visual Studio 2022 with the "Desktop development with C++" workload.
 
 ```
 build.bat
 ```
 
-出力先は `publish\fastgif.exe` で、中間ファイルは `build\` に出ます。アイコン（`res\fastgif.ico`）は `tools\make_icon.ps1` で作り直せます。
+The exe is written to `publish\fastgif.exe`, and intermediate files go to `build\`.
 
-`test\build_test.bat` で検証ツール `test_wic.exe` をビルドできます。これは自前のデコーダの全フレームを Windows 標準の WIC デコーダと突き合わせるツールです。
+| Script | Purpose |
+|---|---|
+| `test\build_test.bat` | Builds `test_wic.exe`, which compares every frame from FastGif's decoder with WIC |
+| `tools\make_icon.ps1` | Regenerates the icon (`res\fastgif.ico`) |
+| `tools\make_sample_gif.ps1` | Regenerates the sample animation (`docs\sample.gif`) |
 
-## 仕様メモ
+## Notes
 
-- 遅延が 0〜1（1/100 秒単位）のフレームは、ブラウザと同じく 100ms として扱います
-- ループ回数の指定は無視して、常にループ再生します
-- disposal 2（背景で消去）は透過として扱います（ブラウザと同じ）
-- 画像サイズの上限は 6,400 万ピクセル（8192×8192 相当）です
+- Frames with a delay of 0–1 (in 1/100 s) are shown for 100 ms, the same as in web browsers.
+- The loop count stored in the file is ignored, and the animation always loops.
+- Disposal method 2 (restore to background) clears to transparent, the same as in browsers.
+- The largest image size supported is 64 million pixels (about 8192×8192).
+
+## License
+
+[MIT](LICENSE)

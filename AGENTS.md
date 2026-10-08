@@ -20,7 +20,10 @@ Windows 11 用のアニメーション GIF ビューワです。依頼者の要�
 | `build.bat` | ビルドスクリプト。出力は `publish\fastgif.exe`、中間ファイルは `build\` |
 | `publish\fastgif.exe` | 配布用の Release exe |
 | `test\test_wic.cpp` / `test\build_test.bat` | 自作デコーダを WIC と全フレーム比較する検証ツール（こちらは CRT を使ってよい） |
-| `README.md` | 利用者向けの説明 |
+| `README.md` / `README.ja.md` | 利用者向けの説明（英語 / 日本語）。片方を変えたらもう片方も合わせる |
+| `LICENSE` | MIT ライセンス |
+| `docs\screenshot.png` / `docs\sample.gif` | README 用のスクリーンショットと、自作のサンプル GIF |
+| `tools\make_sample_gif.ps1` | サンプル GIF の生成スクリプト（WPF で描画し、遅延とループ指定をバイナリに書き足す） |
 
 ## 守るべき設計方針
 
@@ -76,6 +79,13 @@ Windows 11 用のアニメーション GIF ビューワです。依頼者の要�
 ### 4. ini の保存先を厳密にした
 - 依頼：exe と同じフォルダに保存できない場合だけ `%APPDATA%` に保存する
 - 書き込みは元から「exe フォルダ → 失敗したら APPDATA」だった。読み込みが「両方あれば新しい方」だったので、「exe フォルダの ini が書き込み可能ならそれ、ダメなときだけ APPDATA」に改めた
+
+### 5. git 化と GitHub での公開
+- git リポジトリを作成した（ブランチ `main`）。`.gitattributes` で `.bat` と `.rc` を CRLF に固定した
+- `publish/` はビルドで作られるものなので、git の管理から外した
+- MIT ライセンスを付け、README を英語（`README.md`）と日本語（`README.ja.md`）に分けた
+- スクリーンショットに第三者の GIF を使わないよう、サンプル GIF を自作した（`docs/sample.gif`）
+- GitHub に Public リポジトリ `fast_gifanim` として公開した（gh が入っていないため、空のリポジトリは利用者が作成し、push はエージェントが行った）
 
 ## ビルドとテストの手順
 
