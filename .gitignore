@@ -8,3 +8,6 @@ test/*.exe
 
 # 実行時に作られる設定ファイル
 *.ini
+
+# Release 出力 (build.bat で生成)
+publish/
