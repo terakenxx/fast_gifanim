@@ -13,6 +13,7 @@ struct GifFrame {
     u16 x, y, w, h;
     u16 lctSize;
     u32 delay;        // ms
+    u16 rawDelay;     // ファイルに書かれた値 (1/100 秒)
     u8 minCode, interlace, disposal, hasTrans, trans;
 };
 
@@ -97,7 +98,8 @@ static bool gifParseNext(Gif& g) {
             f.disposal = disp;
             f.hasTrans = hasT;
             f.trans = t;
-            f.delay = delay <= 1 ? 100 : delay * 10;   // ブラウザ互換: 0/1cs は 100ms 扱い
+            f.rawDelay = (u16)delay;
+            f.delay = delay ? delay * 10 : 100;        // 0 (指定なし) は 100ms。1/100 秒指定はそのまま 10ms
             if (!gifPush(g, f)) break;
             p = gifSkipSub(g, p);
             g.parsePos = p;
@@ -174,10 +176,13 @@ static inline u32 gifInterlaceRow(u32 r, u32 h) {
 
 // LZW 展開。辞書を「出力済みバッファ内の位置+長さ」で持ち、文字列をそのままコピーする高速方式。
 // 戻り値は書き込んだピクセル数 (データ破損・途切れ時は途中まで)
-static u32 s_lzwStart[4096];
-static u16 s_lzwLen[4096];
+// 辞書テーブルは呼び出し側が持つ (複数スレッドで同時にデコードできるように)
+struct GifLzwTables {
+    u32 start[4096];
+    u16 len[4096];
+};
 
-static u32 gifLzw(const Gif& g, const GifFrame& f, u8* out, u32 cap) {
+static u32 gifLzw(const Gif& g, const GifFrame& f, u8* out, u32 cap, GifLzwTables* tab) {
     u32 minCode = f.minCode;
     if (minCode < 1 || minCode > 11) return 0;
     const u8* d = g.d;
@@ -188,8 +193,8 @@ static u32 gifLzw(const Gif& g, const GifFrame& f, u8* out, u32 cap) {
     u32 bits = 0, blk = 0, outPos = 0;
     u32 prevPos = 0, prevLen = 0;
     bool havePrev = false;
-    u32* start = s_lzwStart;
-    u16* len = s_lzwLen;
+    u32* start = tab->start;
+    u16* len = tab->len;
 
     for (;;) {
         while (bits < cs) {

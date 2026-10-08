@@ -16,53 +16,336 @@ void* __cdecl memcpy(void* d, const void* s, size_t n) {
     __movsb((unsigned char*)d, (const unsigned char*)s, n);
     return d;
 }
+int _fltused = 0;                       // 縮小処理で float を使うため (CRT なしでのリンク用)
 }
 
-#include "gif.h"
+#include "player.h"
 
 #define APP_NAME L"FastGif"
-#define MAX_PIXELS (1u << 26)          // 64M ピクセル (8192x8192) まで
 #define BAR_COLOR RGB(30, 30, 30)
 
 static Gif G;
 static const u8* g_view;
-static u32* g_canvas;                   // 合成済みキャンバス (A=0 は透明)
-static u32* g_disp;                     // 背景と合成した表示用バッファ
-static u32* g_save;                     // disposal=3 用の退避領域
-static u8* g_idx;
-static size_t g_idxCap;
-static int g_cur = -1;                  // キャンバスに入っているフレーム (先読み済み)
+static Decoder g_dec;                   // UI スレッドのデコーダ (通常モード)。canvas には先読みした次フレームが入る
+static u32* g_disp;                     // 背景と合成した表示用バッファ (原寸)
+static u32* g_sdisp;                    // g_disp を表示サイズに縮小したもの
+static int g_sdispW, g_sdispH;
+static size_t g_sdispCap;
+static bool g_sdispOk;
+static Scaler g_sc;
 static int g_shown = -1;                // 画面に出ているフレーム
-static bool g_saveValid, g_loaded, g_playing, g_full, g_titleDone;
+static u32 g_shownDelay;                // そのフレームの表示時間 (ms)
+static bool g_loaded, g_playing, g_full, g_titleDone;
 static int g_bg;                        // 0:市松 1:暗灰 2:白 3:黒
 static HWND g_hwnd;
 static HANDLE g_timer;
 static LONGLONG g_freq, g_deadline;
-static BITMAPINFO g_bmi;
 static HBRUSH g_barBrush;
 static WINDOWPLACEMENT g_wp;
 static wchar_t g_path[32768], g_tmp[32768];
 
-static void* valloc(size_t n) { return VirtualAlloc(0, n, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE); }
-static void vfree(void* p) { if (p) VirtualFree(p, 0, MEM_RELEASE); }
 static LONGLONG qpc() { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
+
+static void setBmi(BITMAPINFO& b, int w, int h) {
+    memset(&b, 0, sizeof b);
+    b.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    b.bmiHeader.biWidth = w;
+    b.bmiHeader.biHeight = -h;          // トップダウン
+    b.bmiHeader.biPlanes = 1;
+    b.bmiHeader.biBitCount = 32;
+    b.bmiHeader.biCompression = BI_RGB;
+}
+
+// ---------------------------------------------------------------- 先読みキャッシュ (遅延を検知したら使う)
+// 通常は UI スレッドで 1 フレームずつデコードする (1 枚目を最速で出すため)。
+// 再生が間に合わない状態が続いたら、別スレッドでファイルを先読みし、フレームを表示サイズに縮小した状態で
+// メモリに貯めておく方式に切り替える。メモリに入りきらない分は、再生位置から遠いフレームから入れ替える。
+
+struct Slot {
+    u32* px;                            // 背景合成・縮小済みの画素 (0 = 未作成)
+    int w, h;
+    LONG gen;                           // 作成時の世代 (背景色を変えたら古くなる)
+    u32 delay;
+};
+
+static bool g_modeB;                    // 先読みキャッシュで再生中
+static CRITICAL_SECTION g_cs;           // g_slots / g_cacheBytes を保護
+static Slot* g_slots;
+static int g_slotCap;
+static size_t g_cacheBytes, g_budget;
+static HANDLE g_worker, g_wake, g_readyEvt;
+static volatile LONG g_quit, g_gen, g_tw, g_th, g_want, g_shownV, g_bCount, g_bDone;
+static Decoder g_wdec;                  // 先読みスレッドのデコーダ
+static bool g_waitFrame, g_waitArm;     // 次のフレームの完成待ち
+static u32 g_slowHist;                  // 直近フレームの「間に合わなかった」履歴 (ビット列)
+static int g_ticks;
+
+static int frameCount() { return g_modeB ? (int)g_bCount : G.count; }
+static bool parseDone() { return g_modeB ? g_bDone != 0 : G.parseDone; }
+
+static bool slotValid(const Slot& s, int tw, int th, LONG gen) { return s.px && s.w == tw && s.h == th && s.gen == gen; }
+
+// want から数えて何フレーム先か (総数が未確定の間は、パース済みの数で近似)
+static int cacheDist(int f, int want, int count) {
+    int d = f - want;
+    return d < 0 ? d + count : d;
+}
+
+// 次に作るべきフレーム。全部そろっていれば -1、未パースの次フレームなら G.count を返す
+static int cachePick(int want, int shown, int tw, int th, LONG gen) {
+    int count = G.count;
+    if (want >= count) return G.parseDone ? 0 : count;   // 総数が確定したら末尾の次は先頭
+    for (int d = 0; d < count; d++) {
+        int f = want + d;
+        if (f >= count) {
+            if (!G.parseDone) return count;     // 総数が未確定: 先頭へ戻る前に続きをパースする
+            f -= count;
+        }
+        if (f == shown && d) continue;
+        if (f >= g_slotCap || !slotValid(g_slots[f], tw, th, gen)) return f;
+    }
+    return G.parseDone ? -1 : count;
+}
+
+// f を置くために追い出すフレーム。古い (サイズ・世代違い) ものを優先し、無ければ f より遠いもの (-1 = 無し)
+static int cacheVictim(int f, int want, int shown, int tw, int th, LONG gen) {
+    int count = G.count, best = -1, bestD = cacheDist(f, want, count);
+    for (int e = 0; e < g_slotCap && e < count; e++) {
+        const Slot& s = g_slots[e];
+        if (!s.px || e == f || e == shown) continue;
+        if (!slotValid(s, tw, th, gen)) return e;
+        int d = cacheDist(e, want, count);
+        if (d > bestD) { bestD = d; best = e; }
+    }
+    return best;
+}
+
+static bool cacheHasRoom(int f, size_t bytes, int want, int shown, int tw, int th, LONG gen) {
+    size_t cur = f < g_slotCap && g_slots[f].px ? (size_t)g_slots[f].w * g_slots[f].h * 4 : 0;
+    return g_cacheBytes - cur + bytes <= g_budget || cacheVictim(f, want, shown, tw, th, gen) >= 0;
+}
+
+static void cacheEvictLocked(int e, u32** freeList, int* nFree) {
+    Slot& s = g_slots[e];
+    g_cacheBytes -= (size_t)s.w * s.h * 4;
+    freeList[(*nFree)++] = s.px;
+    s.px = 0;
+}
+
+static void workerPublish() {
+    InterlockedExchange(&g_bCount, G.count);
+    if (InterlockedExchange(&g_bDone, G.parseDone) != (LONG)G.parseDone)
+        SetEvent(g_readyEvt);                       // 総数が確定した: 待っている UI に要求し直させる
+}
+
+// フレーム k (先読みデコーダのキャンバスにある) を表示用に作って登録する
+static void cacheProduce(int k, Scaler& sc, u32* comp) {
+    int tw = g_tw, th = g_th;
+    LONG gen = g_gen;
+    int want = g_want, shown = g_shownV;
+    size_t bytes = (size_t)tw * th * 4;
+    u32* freeList[64];
+    int nFree = 0;
+    EnterCriticalSection(&g_cs);
+    size_t cur = k < g_slotCap && g_slots[k].px ? (size_t)g_slots[k].w * g_slots[k].h * 4 : 0;
+    while (g_cacheBytes - cur + bytes > g_budget && nFree < 64) {
+        int e = cacheVictim(k, want, shown, tw, th, gen);
+        if (e < 0) break;
+        cacheEvictLocked(e, freeList, &nFree);
+    }
+    bool ok = g_cacheBytes - cur + bytes <= g_budget;
+    LeaveCriticalSection(&g_cs);
+    for (int i = 0; i < nFree; i++) plFree(freeList[i]);
+    if (!ok) return;
+
+    u32* buf = (u32*)plAlloc(bytes);
+    if (!buf) return;
+    int bg = g_bg;
+    if (tw == G.W && th == G.H) {
+        composeBg(g_wdec.canvas, buf, G.W, G.H, bg);
+    } else {
+        composeBg(g_wdec.canvas, comp, G.W, G.H, bg);
+        if (!scaleDown(sc, comp, G.W, G.H, buf, tw, th)) { plFree(buf); return; }
+    }
+    u32 delay = G.frames[k].delay;
+
+    u32* old = 0;
+    EnterCriticalSection(&g_cs);
+    if (k >= g_slotCap) {
+        int nc = g_slotCap * 2;
+        while (nc <= k) nc *= 2;
+        void* p = HeapReAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, g_slots, sizeof(Slot) * nc);
+        if (p) {
+            g_slots = (Slot*)p;
+            g_slotCap = nc;
+        }
+    }
+    if (k < g_slotCap) {
+        Slot& s = g_slots[k];
+        if (s.px) {
+            g_cacheBytes -= (size_t)s.w * s.h * 4;
+            old = s.px;
+        }
+        s.px = buf;
+        s.w = tw;
+        s.h = th;
+        s.gen = gen;
+        s.delay = delay;
+        g_cacheBytes += bytes;
+        buf = 0;
+    }
+    LeaveCriticalSection(&g_cs);
+    plFree(old);
+    plFree(buf);
+    SetEvent(g_readyEvt);
+}
+
+static DWORD WINAPI cacheWorker(void*) {
+    Scaler sc;
+    memset(&sc, 0, sizeof sc);
+    u32* comp = (u32*)plAlloc((size_t)G.W * G.H * 4);
+    // 残りのファイルを OS にまとめて読み込ませる (非同期。ページフォールトでの細切れ読み込みを避ける)
+    size_t from = g_wdec.cur >= 0 ? G.frames[g_wdec.cur].data : 0;
+    WIN32_MEMORY_RANGE_ENTRY range = {(void*)(g_view + from), G.n - from};
+    if (range.NumberOfBytes > ((size_t)2 << 30)) range.NumberOfBytes = (size_t)2 << 30;
+    PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0);
+
+    if (comp) cacheProduce(g_wdec.cur, sc, comp);   // 引き継いだキャンバスにある次フレーム
+    while (comp && !g_quit) {
+        int want = g_want, shown = g_shownV, tw = g_tw, th = g_th;
+        LONG gen = g_gen;
+        size_t bytes = (size_t)tw * th * 4;
+        EnterCriticalSection(&g_cs);
+        int f = cachePick(want, shown, tw, th, gen);
+        bool room = f >= 0 && cacheHasRoom(f, bytes, want, shown, tw, th, gen);
+        LeaveCriticalSection(&g_cs);
+        if (f < 0 || !room) {                       // 全部そろった / メモリが一杯: 再生が進むまで待つ
+            if (!G.parseDone) {                     // 手が空いている間に総フレーム数を確定させておく (逆方向のコマ送り用)
+                for (int i = 0; i < 16 && gifParseNext(G); i++) {}
+                workerPublish();
+                continue;
+            }
+            WaitForSingleObject(g_wake, INFINITE);
+            continue;
+        }
+        int next = g_wdec.cur + 1;
+        if (G.parseDone && next >= G.count) next = 0;
+        if (f < next) g_wdec.cur = -1;              // 目的のフレームを通り過ぎている: 先頭から作り直す
+        int k = decNext(g_wdec, G);
+        workerPublish();
+        if (k == f) cacheProduce(k, sc, comp);
+    }
+    scalerFree(sc);
+    plFree(comp);
+    return 0;
+}
+
+static void stopCache() {
+    if (g_worker) {
+        InterlockedExchange(&g_quit, 1);
+        SetEvent(g_wake);
+        WaitForSingleObject(g_worker, INFINITE);
+        CloseHandle(g_worker);
+        g_worker = 0;
+    }
+    if (g_slots) {
+        for (int i = 0; i < g_slotCap; i++) plFree(g_slots[i].px);
+        HeapFree(GetProcessHeap(), 0, g_slots);
+        g_slots = 0;
+    }
+    g_slotCap = 0;
+    g_cacheBytes = 0;
+    decFree(g_wdec);
+    g_modeB = false;
+    g_waitFrame = false;
+    g_slowHist = 0;
+    g_ticks = 0;
+    if (g_readyEvt) ResetEvent(g_readyEvt);
+    if (g_hwnd) RemovePropW(g_hwnd, L"FastGifCache");
+}
+
+static RECT imageRect();
+static bool isAnimated();
+
+static void cacheSetTarget() {
+    RECT r = imageRect();
+    InterlockedExchange(&g_tw, r.right - r.left);
+    InterlockedExchange(&g_th, r.bottom - r.top);
+    SetEvent(g_wake);
+}
+
+// 先読みキャッシュ方式に切り替える。UI のデコーダ (次フレームまで進んだ状態) をそのまま先読みスレッドに渡す
+static void startCache() {
+    if (g_modeB || !isAnimated()) return;
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof ms;
+    GlobalMemoryStatusEx(&ms);
+    g_budget = (size_t)(ms.ullAvailPhys / 2);
+    if (g_budget > ((size_t)3 << 30)) g_budget = (size_t)3 << 30;
+    if (g_budget < ((size_t)64 << 20)) g_budget = (size_t)64 << 20;
+    wchar_t v[16];                                  // テスト用: FASTGIF_CACHE_MB でメモリ上限を指定できる
+    if (GetEnvironmentVariableW(L"FASTGIF_CACHE_MB", v, 16)) {
+        size_t mb = 0;
+        for (const wchar_t* p = v; *p >= L'0' && *p <= L'9'; p++) mb = mb * 10 + (*p - L'0');
+        if (mb) g_budget = mb << 20;
+    }
+    g_slotCap = G.count + 64;
+    g_slots = (Slot*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(Slot) * g_slotCap);
+    if (!g_slots) { g_slotCap = 0; return; }
+    g_cacheBytes = 0;
+    g_wdec = g_dec;
+    memset(&g_dec, 0, sizeof g_dec);
+    g_dec.cur = -1;
+    g_quit = 0;
+    g_want = g_wdec.cur;
+    g_shownV = g_shown;
+    workerPublish();
+    RECT r = imageRect();
+    g_tw = r.right - r.left;
+    g_th = r.bottom - r.top;
+    g_modeB = true;
+    g_worker = CreateThread(0, 0, cacheWorker, 0, 0, 0);
+    if (!g_worker) {                                // 失敗したら通常モードのまま
+        g_dec = g_wdec;
+        memset(&g_wdec, 0, sizeof g_wdec);
+        HeapFree(GetProcessHeap(), 0, g_slots);
+        g_slots = 0;
+        g_slotCap = 0;
+        g_modeB = false;
+        return;
+    }
+    SetPropW(g_hwnd, L"FastGifCache", (HANDLE)1);   // 動作確認用 (外部から先読みモードかを調べられる)
+}
+
+// 再生が間に合っているかを記録し、間に合わない状態が続いたら先読みに切り替える。
+// 最初の数フレームや一時的な遅れは問題にしない (1 枚目を早く出すことを優先)
+static void noteSpeed(bool slow) {
+    g_ticks++;
+    g_slowHist = ((g_slowHist << 1) | (slow ? 1u : 0u)) & 0xFF;
+    int n = 0;
+    for (u32 h = g_slowHist; h; h &= h - 1) n++;
+    if (g_ticks >= 8 && n >= 6) startCache();     // 直近 8 フレーム中 6 フレームが遅れた
+    else if (g_ticks == 2 && GetEnvironmentVariableW(L"FASTGIF_FORCE_CACHE", 0, 0)) startCache();   // テスト用
+}
 
 // ---------------------------------------------------------------- ファイル
 
 static void closeGif() {
     g_playing = false;
     if (g_timer) CancelWaitableTimer(g_timer);
-    vfree(g_canvas); vfree(g_disp); vfree(g_save); vfree(g_idx);
-    g_canvas = g_disp = g_save = 0;
-    g_idx = 0;
-    g_idxCap = 0;
+    stopCache();
+    decFree(g_dec);
+    scalerFree(g_sc);
+    plFree(g_disp); plFree(g_sdisp);
+    g_disp = g_sdisp = 0;
+    g_sdispCap = 0;
+    g_sdispOk = false;
     if (g_view) UnmapViewOfFile(g_view);
     g_view = 0;
     if (G.frames) HeapFree(GetProcessHeap(), 0, G.frames);
     memset(&G, 0, sizeof G);
     g_loaded = false;
-    g_cur = g_shown = -1;
-    g_saveValid = false;
+    g_shown = -1;
 }
 
 static bool openGifInner(const wchar_t* path) {
@@ -81,17 +364,8 @@ static bool openGifInner(const wchar_t* path) {
     if (!g_view || !gifOpen(G, g_view, (size_t)sz.QuadPart)) return false;
     size_t px = (size_t)G.W * G.H;
     if (px > MAX_PIXELS) return false;
-    // VirtualAlloc はゼロ初期化済み & 触ったページだけ実メモリになる
-    g_canvas = (u32*)valloc(px * 4);
-    g_disp = (u32*)valloc(px * 4);
-    g_save = (u32*)valloc(px * 4);
-    if (!g_canvas || !g_disp || !g_save) return false;
-    g_bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    g_bmi.bmiHeader.biWidth = G.W;
-    g_bmi.bmiHeader.biHeight = -G.H;    // トップダウン
-    g_bmi.bmiHeader.biPlanes = 1;
-    g_bmi.bmiHeader.biBitCount = 32;
-    g_bmi.bmiHeader.biCompression = BI_RGB;
+    g_disp = (u32*)plAlloc(px * 4);
+    if (!g_disp || !decInit(g_dec, G)) return false;
     return g_loaded = true;
 }
 
@@ -102,97 +376,7 @@ static bool openGif(const wchar_t* path) {
     return false;
 }
 
-// ---------------------------------------------------------------- 合成
-
-static bool clipFrame(const GifFrame& f, int& x0, int& y0, int& x1, int& y1) {
-    x0 = f.x; y0 = f.y;
-    x1 = f.x + f.w; y1 = f.y + f.h;
-    if (x1 > G.W) x1 = G.W;
-    if (y1 > G.H) y1 = G.H;
-    return x0 < x1 && y0 < y1;
-}
-
-static void rectOp(const GifFrame& f, int op) {   // 0:透明で消去 1:退避 2:復元
-    int x0, y0, x1, y1;
-    if (!clipFrame(f, x0, y0, x1, y1)) return;
-    size_t bytes = (size_t)(x1 - x0) * 4;
-    for (int y = y0; y < y1; y++) {
-        size_t o = (size_t)y * G.W + x0;
-        if (op == 0) memset(g_canvas + o, 0, bytes);
-        else if (op == 1) memcpy(g_save + o, g_canvas + o, bytes);
-        else memcpy(g_canvas + o, g_save + o, bytes);
-    }
-}
-
-static void drawFrame(const GifFrame& f) {
-    if (!f.w || !f.h || f.x >= G.W || f.y >= G.H) return;
-    size_t np = (size_t)f.w * f.h;
-    if (np > MAX_PIXELS) return;
-    if (np > g_idxCap) {
-        vfree(g_idx);
-        g_idx = (u8*)valloc(np);
-        g_idxCap = g_idx ? np : 0;
-        if (!g_idx) return;
-    }
-    u32 got = gifLzw(G, f, g_idx, (u32)np);
-    u32 pal[256];
-    gifPalette(G, f, pal);
-    if (f.hasTrans) pal[f.trans] = 0;
-    u32 cols = f.w;
-    if (f.x + cols > (u32)G.W) cols = G.W - f.x;
-    u32 full = got / f.w, rem = got % f.w;
-    for (u32 r = 0; r < f.h; r++) {
-        u32 cnt = r < full ? cols : (r == full ? (rem < cols ? rem : cols) : 0);
-        if (!cnt) break;                                  // データ途切れ: 以降は前フレームのまま
-        u32 dy = f.y + (f.interlace ? gifInterlaceRow(r, f.h) : r);
-        if (dy >= (u32)G.H) continue;
-        const u8* s = g_idx + (size_t)r * f.w;
-        u32* dp = g_canvas + (size_t)dy * G.W + f.x;
-        if (f.hasTrans) {
-            for (u32 i = 0; i < cnt; i++) {
-                u32 c = pal[s[i]];
-                if (c) dp[i] = c;
-            }
-        } else {
-            for (u32 i = 0; i < cnt; i++) dp[i] = pal[s[i]];
-        }
-    }
-}
-
-// キャンバスを次のフレームに進める (末尾なら先頭へループ)
-static void decodeNext() {
-    int k = g_cur + 1;
-    while (k >= G.count)
-        if (!gifParseNext(G)) { k = 0; break; }
-    if (k == 0) {
-        memset(g_canvas, 0, (size_t)G.W * G.H * 4);
-    } else {
-        const GifFrame& p = G.frames[g_cur];
-        if (p.disposal == 2) rectOp(p, 0);
-        else if (p.disposal == 3 && g_saveValid) rectOp(p, 2);
-    }
-    const GifFrame& f = G.frames[k];
-    g_saveValid = f.disposal == 3;
-    if (g_saveValid) rectOp(f, 1);
-    drawFrame(f);
-    g_cur = k;
-}
-
-static void compose() {
-    static const u32 bgs[4][2] = {
-        {0xFF3C3C3C, 0xFF2C2C2C}, {0xFF1E1E1E, 0xFF1E1E1E}, {0xFFFFFFFF, 0xFFFFFFFF}, {0xFF000000, 0xFF000000}};
-    const u32* bg = bgs[g_bg];
-    int W = G.W, H = G.H;
-    for (int y = 0; y < H; y++) {
-        const u32* s = g_canvas + (size_t)y * W;
-        u32* d = g_disp + (size_t)y * W;
-        u32 a = bg[(y >> 3) & 1], b = bg[((y >> 3) & 1) ^ 1];
-        for (int x = 0; x < W; x++) {
-            u32 c = s[x];
-            d[x] = c ? c : (((x >> 3) & 1) ? b : a);
-        }
-    }
-}
+static void decodeNext() { decNext(g_dec, G); }
 
 // ---------------------------------------------------------------- 表示
 
@@ -204,7 +388,6 @@ static RECT imageRect() {
         dw = G.W;
         dh = G.H;
     } else if ((LONGLONG)cw * G.H <= (LONGLONG)ch * G.W) {   // はみ出す画像は縦横比を保って縮小
-
         dw = cw;
         dh = (int)((LONGLONG)G.H * cw / G.W);
     } else {
@@ -219,12 +402,63 @@ static RECT imageRect() {
     return r;
 }
 
+// 通常モード: g_disp を表示サイズに縮小して g_sdisp に用意する
+static bool prepareScaled(int dw, int dh) {
+    if (g_sdispOk && g_sdispW == dw && g_sdispH == dh) return true;
+    size_t need = (size_t)dw * dh * 4;
+    if (need > g_sdispCap) {
+        plFree(g_sdisp);
+        g_sdisp = (u32*)plAlloc(need);
+        g_sdispCap = g_sdisp ? need : 0;
+        if (!g_sdisp) return false;
+    }
+    g_sdispOk = scaleDown(g_sc, g_disp, G.W, G.H, g_sdisp, dw, dh);
+    g_sdispW = dw;
+    g_sdispH = dh;
+    return g_sdispOk;
+}
+
+// 通常モード: キャンバス (先読みした次フレーム) を表示する
 static void present() {
-    compose();
-    g_shown = g_cur;
+    composeBg(g_dec.canvas, g_disp, G.W, G.H, g_bg);
+    g_shown = g_dec.cur;
+    g_shownDelay = G.frames[g_shown].delay;
     RECT r = imageRect();
+    g_sdispOk = false;
+    if (r.right - r.left != G.W || r.bottom - r.top != G.H) prepareScaled(r.right - r.left, r.bottom - r.top);
     InvalidateRect(g_hwnd, &r, FALSE);
     UpdateWindow(g_hwnd);
+}
+
+static void blit(HDC dc, const RECT& ir, const u32* px, int w, int h, int mode) {
+    BITMAPINFO bmi;
+    setBmi(bmi, w, h);
+    int dw = ir.right - ir.left, dh = ir.bottom - ir.top;
+    if (dw == w && dh == h) {
+        SetDIBitsToDevice(dc, ir.left, ir.top, w, h, 0, 0, 0, h, px, &bmi, DIB_RGB_COLORS);
+    } else {
+        SetStretchBltMode(dc, mode);
+        SetBrushOrgEx(dc, 0, 0, 0);
+        StretchDIBits(dc, ir.left, ir.top, dw, dh, 0, 0, w, h, px, &bmi, DIB_RGB_COLORS, SRCCOPY);
+    }
+}
+
+static void paintImage(HDC dc, const RECT& ir) {
+    int dw = ir.right - ir.left, dh = ir.bottom - ir.top;
+    if (g_modeB) {
+        bool done = false;
+        EnterCriticalSection(&g_cs);
+        if (g_shown >= 0 && g_shown < g_slotCap && g_slots[g_shown].px) {
+            const Slot& s = g_slots[g_shown];
+            blit(dc, ir, s.px, s.w, s.h, COLORONCOLOR);   // サイズ違いは作り直されるまでの間だけ
+            done = true;
+        }
+        LeaveCriticalSection(&g_cs);
+        if (done) return;
+    }
+    if (dw == G.W && dh == G.H) blit(dc, ir, g_disp, G.W, G.H, COLORONCOLOR);
+    else if (prepareScaled(dw, dh)) blit(dc, ir, g_sdisp, dw, dh, COLORONCOLOR);
+    else blit(dc, ir, g_disp, G.W, G.H, HALFTONE);
 }
 
 static void paint(HWND h) {
@@ -238,14 +472,7 @@ static void paint(HWND h) {
         SetRect(&t, 0, ir.bottom, rc.right, rc.bottom);     FillRect(dc, &t, g_barBrush);
         SetRect(&t, 0, ir.top, ir.left, ir.bottom);         FillRect(dc, &t, g_barBrush);
         SetRect(&t, ir.right, ir.top, rc.right, ir.bottom); FillRect(dc, &t, g_barBrush);
-        int dw = ir.right - ir.left, dh = ir.bottom - ir.top;
-        if (dw == G.W && dh == G.H) {
-            SetDIBitsToDevice(dc, ir.left, ir.top, G.W, G.H, 0, 0, 0, G.H, g_disp, &g_bmi, DIB_RGB_COLORS);
-        } else {
-            SetStretchBltMode(dc, dw < G.W ? HALFTONE : COLORONCOLOR);   // 縮小は滑らか / 拡大はドット維持
-            SetBrushOrgEx(dc, 0, 0, 0);
-            StretchDIBits(dc, ir.left, ir.top, dw, dh, 0, 0, G.W, G.H, g_disp, &g_bmi, DIB_RGB_COLORS, SRCCOPY);
-        }
+        paintImage(dc, ir);
     } else {
         FillRect(dc, &rc, g_barBrush);
         HFONT font = CreateFontW(-MulDiv(12, GetDpiForWindow(h), 72), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
@@ -267,26 +494,28 @@ static void paint(HWND h) {
     EndPaint(h, &ps);
 }
 
-static bool isAnimated() { return g_loaded && !(G.parseDone && G.count == 1); }
+static bool isAnimated() { return g_loaded && !(parseDone() && frameCount() == 1); }
 
 static void setTitle() {
     static wchar_t b[1024];
     const wchar_t* name = g_path;
     for (const wchar_t* p = g_path; *p; p++)
         if (*p == L'\\' || *p == L'/') name = p + 1;
+    bool done = parseDone();
+    int count = frameCount();
     if (!g_loaded) {
         if (g_path[0]) wsprintfW(b, L"%.300s - 読み込めません - " APP_NAME, name);
         else lstrcpyW(b, APP_NAME);
     } else {
         // フレーム総数は末尾までパースし終えてから表示 (遅延パースのため)
         int n = wsprintfW(b, L"%.300s - %d×%d", name, G.W, G.H);
-        if (G.parseDone) n += wsprintfW(b + n, L" - %d フレーム", G.count);
+        if (done) n += wsprintfW(b + n, L" - %d フレーム", count);
         if (!g_playing && isAnimated()) {
             n += wsprintfW(b + n, L"  [一時停止 %d", g_shown + 1);
-            wsprintfW(b + n, G.parseDone ? L"/%d]" : L"]", G.count);
+            wsprintfW(b + n, done ? L"/%d]" : L"]", count);
         }
     }
-    g_titleDone = G.parseDone;
+    g_titleDone = done;
     SetWindowTextW(g_hwnd, b);
 }
 
@@ -304,11 +533,63 @@ static void armAfter(u32 ms, bool reset) {
     SetWaitableTimer(g_timer, &due, 0, 0, 0, FALSE);
 }
 
+static void countPresented() {          // 動作確認用: 表示したフレーム数 (外部から再生速度を測れる)
+    static UINT_PTR n;
+    SetPropW(g_hwnd, L"FastGifFrames", (HANDLE)++n);
+}
+
+// 先読みモード: 次に表示したいフレームを伝える
+static void setWant(int f) {
+    InterlockedExchange(&g_want, f);
+    SetEvent(g_wake);
+}
+
+// 先読みモード: g_want のフレームが出来ていれば表示する。無ければ完成を待つ
+static bool showWanted(bool arm) {
+    int f = g_want;
+    if (g_bDone && f >= (int)g_bCount) {            // 総数が確定する前に「末尾の次」を要求していた
+        f = 0;
+        setWant(0);
+    }
+    bool ok;
+    EnterCriticalSection(&g_cs);
+    ok = f < g_slotCap && g_slots[f].px;
+    if (ok) g_shownDelay = g_slots[f].delay;
+    LeaveCriticalSection(&g_cs);
+    if (!ok) {
+        g_waitFrame = true;
+        g_waitArm = arm;
+        return false;
+    }
+    g_waitFrame = false;
+    g_shown = f;
+    InterlockedExchange(&g_shownV, f);
+    int nx = f + 1;
+    if (g_bDone && nx >= (int)g_bCount) nx = 0;
+    setWant(nx);
+    RECT r = imageRect();
+    InvalidateRect(g_hwnd, &r, FALSE);
+    UpdateWindow(g_hwnd);
+    countPresented();
+    if (arm) armAfter(g_shownDelay, false);
+    if (!g_playing || parseDone() != g_titleDone) setTitle();   // 一時停止中はフレーム番号を出している
+    return true;
+}
+
 static void tick() {
+    if (g_modeB) {
+        showWanted(true);
+        return;
+    }
+    LONGLONG t0 = qpc();
     present();
-    armAfter(G.frames[g_shown].delay, false);
+    countPresented();
+    u32 delay = g_shownDelay;
+    armAfter(delay, false);
     decodeNext();                                   // 次フレームを先読みしておく
+    LONGLONG ms = (qpc() - t0) * 1000 / g_freq;
     if (G.parseDone != g_titleDone) setTitle();
+    noteSpeed(ms >= (LONGLONG)delay);
 }
 
 static void stopPlay() {
@@ -318,7 +599,7 @@ static void stopPlay() {
 
 static void startAfterShown(bool reset) {
     g_playing = true;
-    armAfter(G.frames[g_shown].delay, reset);
+    armAfter(g_shownDelay, reset);
 }
 
 static void togglePause() {
@@ -329,8 +610,8 @@ static void togglePause() {
 }
 
 static void renderTo(int t) {
-    g_cur = -1;
-    do decodeNext(); while (g_cur != t);
+    g_dec.cur = -1;
+    do decodeNext(); while (g_dec.cur != t);
     present();
     decodeNext();
 }
@@ -338,7 +619,18 @@ static void renderTo(int t) {
 static void step(int dir) {
     if (!isAnimated()) return;
     stopPlay();
-    if (dir > 0) {
+    if (g_modeB) {
+        // 前の要求がまだ完成待ちなら、その要求を基準に進める (連打を取りこぼさない)
+        int base = g_waitFrame ? (int)g_want : g_shown;
+        int t = base + dir;
+        if (t < 0) {
+            if (!g_bDone) return;
+            t = (int)g_bCount - 1;
+        }
+        if (g_bDone && t >= (int)g_bCount) t = 0;
+        setWant(t);
+        showWanted(false);
+    } else if (dir > 0) {
         present();
         decodeNext();
     } else {
@@ -354,9 +646,31 @@ static void step(int dir) {
 
 static void goFirst() {
     if (!isAnimated()) return;
+    if (g_modeB) {
+        setWant(0);
+        if (showWanted(false) && g_playing) startAfterShown(true);
+        else if (g_waitFrame) g_waitArm = g_playing;
+        if (!g_playing) setTitle();
+        return;
+    }
     renderTo(0);
     if (g_playing) startAfterShown(true);
     else setTitle();
+}
+
+// 背景色を変えたら表示中の画像も作り直す
+static void changeBg() {
+    if (!g_loaded) return;
+    g_bg = (g_bg + 1) & 3;
+    if (g_modeB) {
+        InterlockedIncrement(&g_gen);
+        SetEvent(g_wake);
+    } else if (!g_playing) {
+        // 一時停止中: キャンバスには先読みした次フレームが入っているので、表示中のフレームを作り直す
+        // (再生中は次のフレームから新しい背景になる)
+        renderTo(g_shown);
+    }
+    InvalidateRect(g_hwnd, 0, FALSE);
 }
 
 // ---------------------------------------------------------------- ウィンドウ位置・サイズの保存 (ini)
@@ -499,8 +813,10 @@ static void toggleFull() {
 static void showLoaded() {
     g_titleDone = false;
     if (g_loaded) {
-        compose();
-        g_shown = g_cur;
+        composeBg(g_dec.canvas, g_disp, G.W, G.H, g_bg);
+        g_sdispOk = false;
+        g_shown = g_dec.cur;
+        g_shownDelay = G.frames[g_shown].delay;
         g_playing = true;                   // 単一フレームと判明したら下で止める
     }
     setTitle();
@@ -697,6 +1013,11 @@ static void showHelp() {
     modalTimer(false);
 }
 
+// 先読みモードで待っていたフレームが出来た
+static void onFrameReady() {
+    if (g_modeB && g_waitFrame) showWanted(g_waitArm && g_playing);
+}
+
 // ---------------------------------------------------------------- ウィンドウプロシージャ
 
 static LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
@@ -707,6 +1028,7 @@ static LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_ERASEBKGND:
         return 1;
     case WM_SIZE:
+        if (g_modeB) cacheSetTarget();
         InvalidateRect(h, 0, FALSE);
         trackNormalRect();
         return 0;
@@ -714,7 +1036,10 @@ static LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         trackNormalRect();
         return 0;
     case WM_TIMER:
-        if (wp == 1 && g_playing && WaitForSingleObject(g_timer, 0) == WAIT_OBJECT_0) tick();
+        if (wp == 1) {
+            if (g_playing && WaitForSingleObject(g_timer, 0) == WAIT_OBJECT_0) tick();
+            if (g_readyEvt && WaitForSingleObject(g_readyEvt, 0) == WAIT_OBJECT_0) onFrameReady();
+        }
         return 0;
     case WM_ENTERSIZEMOVE:
     case WM_ENTERMENULOOP:
@@ -750,13 +1075,7 @@ static LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case VK_NEXT: case VK_DOWN: openSibling(1); break;
         case VK_PRIOR: case VK_UP: openSibling(-1); break;
         case 'F': case VK_F11: case VK_RETURN: toggleFull(); break;
-        case 'B':
-            if (g_loaded) {
-                g_bg = (g_bg + 1) & 3;
-                compose();
-                InvalidateRect(h, 0, FALSE);
-            }
-            break;
+        case 'B': changeBg(); break;
         case 'O': if (ctrl) openDialog(); break;
         case VK_F1: showHelp(); break;
         case VK_ESCAPE:
@@ -783,6 +1102,7 @@ static LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_DESTROY:
         saveWindowRect();
+        stopCache();
         PostQuitMessage(0);
         return 0;
     }
@@ -820,6 +1140,7 @@ static void parseCmdLine() {
 extern "C" void entry() {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     HINSTANCE hi = GetModuleHandleW(0);
+    InitializeCriticalSection(&g_cs);
 
     // 1) ファイルを開いてヘッダ解析 → 1 枚目のデコードを別スレッドで開始し、並行してウィンドウを作る
     parseCmdLine();
@@ -838,6 +1159,8 @@ extern "C" void entry() {
     g_freq = f.QuadPart;
     g_timer = CreateWaitableTimerExW(0, 0, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     if (!g_timer) g_timer = CreateWaitableTimerW(0, FALSE, 0);
+    g_wake = CreateEventW(0, FALSE, FALSE, 0);
+    g_readyEvt = CreateEventW(0, FALSE, FALSE, 0);
     g_barBrush = CreateSolidBrush(BAR_COLOR);
 
     WNDCLASSEXW wc;
@@ -876,12 +1199,17 @@ extern "C" void entry() {
     }
     showLoaded();
 
-    // 2) メッセージループ: 高精度 Waitable Timer とメッセージを同時に待つ
+    // 2) メッセージループ: 高精度 Waitable Timer・フレーム完成通知・メッセージを同時に待つ
+    HANDLE waits[2] = {g_timer, g_readyEvt};
     MSG m;
     for (;;) {
-        DWORD r = MsgWaitForMultipleObjectsEx(1, &g_timer, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        DWORD r = MsgWaitForMultipleObjectsEx(2, waits, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
         if (r == WAIT_OBJECT_0) {
             if (g_playing) tick();
+            continue;
+        }
+        if (r == WAIT_OBJECT_0 + 1) {
+            onFrameReady();
             continue;
         }
         while (PeekMessageW(&m, 0, 0, 0, PM_REMOVE)) {

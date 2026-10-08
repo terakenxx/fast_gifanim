@@ -25,7 +25,8 @@ int wmain(int argc, wchar_t** argv) {
         double t0 = now();
         if (!gifOpen(g, buf.data(), sz)) { wprintf(L"FAIL open %s\n", argv[a]); fails++; continue; }
         std::vector<u8> idx((size_t)g.frames[0].w * g.frames[0].h);
-        gifLzw(g, g.frames[0], idx.data(), (u32)idx.size());
+        static GifLzwTables tabs;
+        gifLzw(g, g.frames[0], idx.data(), (u32)idx.size(), &tabs);
         double t1 = now();
         while (gifParseNext(g)) {}
         IWICBitmapDecoder* dec = 0;
@@ -49,7 +50,7 @@ int wmain(int argc, wchar_t** argv) {
             if (w != f.w || h != f.h) { wprintf(L"  frame %u size mismatch\n", i); bad++; fr->Release(); continue; }
             std::vector<u8> wic((size_t)w * h), raw((size_t)w * h), ours((size_t)w * h);
             fr->CopyPixels(0, w, (UINT)wic.size(), wic.data());
-            u32 got = gifLzw(g, f, raw.data(), (u32)raw.size());
+            u32 got = gifLzw(g, f, raw.data(), (u32)raw.size(), &tabs);
             for (u32 r = 0; r < h; r++) {
                 u32 dy = f.interlace ? gifInterlaceRow(r, h) : r;
                 memcpy(&ours[(size_t)dy * w], &raw[(size_t)r * w], w);
